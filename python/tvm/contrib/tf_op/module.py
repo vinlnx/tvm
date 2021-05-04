@@ -17,7 +17,7 @@
 """Module container of TensorFlow TVMDSO op"""
 import tensorflow as tf
 from tensorflow.python.framework import load_library
-from tensorflow.python import platform
+import platform
 
 
 class OpModule:

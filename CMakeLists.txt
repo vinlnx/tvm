@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.2)
 project(tvm C CXX)
 
+# VIN fix for TVM bug
+execute_process(COMMAND "python -c 'import tensorflow as tf; print(\" \".join(tf.sysconfig.get_compile_flags()))'"
+                OUTPUT_VARIABLE VIN_CXX_FLAGS)
+set(CMAKE_CXX_FLAGS "${VIN_CXX_FLAGS} ${CMAKE_CXX_FLAGS}")
+
+execute_process(COMMAND "echo ${VIN_CXX_FLAGS} ||| ${CMAKE_CXX_FLAGS}")
+
 # Utility functions
 include(cmake/utils/Utils.cmake)
 include(cmake/utils/FindCUDA.cmake)
@@ -395,6 +402,11 @@ else()
   set(CMAKE_CXX_FLAGS "/std:c++14 ${CMAKE_CXX_FLAGS}")
   set(CMAKE_CUDA_STANDARD 14)
 endif()
+
+# VIN: fix TVM bug
+#execute_process(COMMAND ${Python3_EXECUTABLE} -c "import tensorflow as tf; print(' '.join(tf.sysconfig.get_compile_flags()))"
+#	OUTPUT_VARIABLE VIN_CXX_FLAGS)
+#set(CMAKE_CXX_FLAGS "-I/usr/local/lib/python3.6/dist-packages/tensorflow/include -D_GLIBCXX_USE_CXX11_ABI=0 ${CMAKE_CXX_FLAGS}")
 
 add_lib_info(${CMAKE_CURRENT_LIST_DIR}/src/support/libinfo.cc)
 
