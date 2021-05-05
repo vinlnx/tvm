@@ -25,6 +25,7 @@
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/packed_func.h>
 #include <tvm/runtime/registry.h>
+#include <tvm/runtime/crt/graph_executor.h>
 
 #include "tensorflow/core/framework/op_kernel.h"
 
@@ -36,7 +37,6 @@ using tensorflow::OpKernel;
 using tensorflow::OpKernelConstruction;
 using tensorflow::OpKernelContext;
 
-using tvm::runtime::TVMArgs;
 using tvm::runtime::TVMArgsSetter;
 using tvm::runtime::TVMRetValue;
 
@@ -313,15 +313,183 @@ class TVMDSOOp : public OpKernel {
       setter(k, &args[k]);
     }
     TVMRetValue rv;
-    tvm_func.CallPacked(TVMArgs(tvm_values.data(), tvm_type_codes.data(), num_total_args), &rv);
+    tvm_func.CallPacked(tvm::runtime::TVMArgs(tvm_values.data(), tvm_type_codes.data(), num_total_args), &rv);
 
     output.CopyToOrigin();
   }
 };
 
+static int read_all(const char* file_description, const char* file_path, char** out_params,
+                    size_t* params_size) {
+  FILE* fp = fopen(file_path, "rb");
+  if (fp == NULL) {
+    return 2;
+  }
+
+  int error = 0;
+  error = fseek(fp, 0, SEEK_END);
+  if (error < 0) {
+    return error;
+  }
+
+  long file_size = ftell(fp);
+  if (file_size < 0) {
+    return (int)file_size;
+  } else if (file_size == 0 || file_size > (10 << 20)) {  // file size should be in (0, 20MB].
+    char buf[128];
+    snprintf(buf, sizeof(buf), "determing file size: %s", file_path);
+    perror(buf);
+    return 2;
+  }
+
+  if (params_size != NULL) {
+    *params_size = file_size;
+  }
+
+  error = fseek(fp, 0, SEEK_SET);
+  if (error < 0) {
+    return error;
+  }
+
+  *out_params = (char*)malloc((unsigned long)file_size);
+  if (fread(*out_params, file_size, 1, fp) != 1) {
+    free(*out_params);
+    *out_params = NULL;
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "reading: %s", file_path);
+    perror(buf);
+    return 2;
+  }
+
+  error = fclose(fp);
+  if (error != 0) {
+    free(*out_params);
+    *out_params = NULL;
+  }
+
+  return 0;
+}
+
+template <typename DEVICE_TYPE>
+class TVMDSOGraph : public OpKernel {
+ private:
+  TVMGraphExecutor* graph;
+  TVMModuleHandle mod;
+  std::string graph_json;
+  std::string lib_path;
+  std::string params_path;
+
+  tensorflow::DataType output_dtype;
+
+  bool has_static_output_shape;
+  std::vector<tensorflow::int64> static_output_shape;
+
+  void initAttributes(OpKernelConstruction* context) {
+    context->GetAttr("graph_json", &graph_json);
+    context->GetAttr("lib_path", &lib_path);
+    context->GetAttr("params_path", &params_path);
+    context->GetAttr("output_dtype", &output_dtype);
+
+    context->GetAttr("has_static_output_shape", &has_static_output_shape);
+    context->GetAttr("static_output_shape", &static_output_shape);
+  }
+
+ public:
+  explicit TVMDSOGraph(OpKernelConstruction* context) : OpKernel(context) {
+    // Get attr
+    initAttributes(context);
+
+    // Load TVM function from dynamic library
+    TVMModLoadFromFile(lib_path.c_str(), "so", &mod);
+  }
+
+  void Compute(tensorflow::OpKernelContext* context) override {
+    // the last input is output shape spec
+    const int num_inputs = context->num_inputs() - 1;
+    DLTensor output;
+    DLTensor inputs[num_inputs];
+    std::vector<TensorAsBuf> buf_info(num_inputs);
+    std::vector<ShapeContainer> shapes(num_inputs);
+
+    tensorflow::Status status;
+    int device_id = TVMDSOOpTrait<DEVICE_TYPE>::device_id(context);
+    int device_type = TVMDSOOpTrait<DEVICE_TYPE>::device_type;
+
+    DLDevice dl_dev = {DLDeviceType(device_type), device_id};
+
+    // Create execution graph
+    TVMGraphExecutor_Create(graph_json.c_str(), mod, &dl_dev, &graph);
+    char* params_data;
+    size_t params_size;
+    read_all("deploy.params", params_path.c_str(), &params_data, &params_size);
+    TVMGraphExecutor_LoadParams(graph, params_data, params_size);
+
+    // Get output shape
+    tensorflow::TensorShape output_shape;
+    auto& output_shape_tensor = context->input(num_inputs);
+    if (has_static_output_shape) {
+      // use static output shape
+      const tensorflow::int64* dims = static_output_shape.data();
+      tensorflow::TensorShapeUtils::MakeShape(dims, static_output_shape.size(), &output_shape);
+    } else if (output_shape_tensor.dims() == 1) {
+      // use shape tensor values as output shape
+      TVMDSOOpTrait<DEVICE_TYPE>::make_shape_from_tensor(output_shape_tensor, &output_shape);
+    } else {
+      // use input tensor shape by default
+      output_shape = context->input(0).shape();
+    }
+
+    for (int i = 0; i < num_inputs; ++i) {
+      // Grab the input tensor
+      auto& input_tensor = context->input(i);
+
+      // Create shape container, should keep ref during execution
+      shapes[i] = input_tensor.shape().dim_sizes();
+      auto shape_ptr = reinterpret_cast<int64_t*>(shapes[i].data());
+
+      TensorAsBuf& input = buf_info[i];
+      input.device_type = device_type;
+
+      EnsureAlignment(context, input_tensor, &input);
+      input.CopyFromOrigin();
+
+      status = MakeDLTensor(input, dl_dev, shape_ptr, &inputs[i]);
+      OP_REQUIRES_OK(context, status);
+
+      char name[20];
+      snprintf(name, sizeof(name), "input_%d", i);
+      TVMGraphExecutor_SetInput(graph, name, &inputs[i]);
+    }
+
+    // Allocate output tensor
+    tensorflow::Tensor* output_tensor;
+    OP_REQUIRES_OK(context, context->allocate_output(0, output_shape, &output_tensor));
+    // shape dimension buf should keel alive on stack
+    auto output_shape_dim_buf = output_tensor->shape().dim_sizes();
+    auto output_shape_ptr = reinterpret_cast<int64_t*>(output_shape_dim_buf.data());
+
+    TensorAsBuf output_buf;
+    output_buf.device_type = device_type;
+    EnsureAlignment(context, *output_tensor, &output_buf);
+
+    status = MakeDLTensor(output_buf, dl_dev, output_shape_ptr, &output);
+    OP_REQUIRES_OK(context, status);
+
+    // Run it!
+    TVMGraphExecutor_Run(graph);
+    TVMGraphExecutor_GetOutput(graph, 0, &output);
+
+    output_buf.CopyToOrigin();
+  } 
+};
+
 #ifdef TF_TVMDSOOP_ENABLE_GPU
-REGISTER_KERNEL_BUILDER(Name("TvmDsoOp").Device(tensorflow::DEVICE_CPU), TVMDSOOp<CPUDevice>);
 REGISTER_KERNEL_BUILDER(Name("TvmDsoOp").Device(tensorflow::DEVICE_GPU), TVMDSOOp<GPUDevice>);
+REGISTER_KERNEL_BUILDER(Name("TvmDsoOp").Device(tensorflow::DEVICE_CPU), TVMDSOOp<CPUDevice>);
+REGISTER_KERNEL_BUILDER(Name("TvmDsoGraph").Device(tensorflow::DEVICE_GPU), TVMDSOGraph<GPUDevice>);
+REGISTER_KERNEL_BUILDER(Name("TvmDsoGraph").Device(tensorflow::DEVICE_CPU), TVMDSOGraph<CPUDevice>);
 #else
 REGISTER_KERNEL_BUILDER(Name("TvmDsoOp").Device(tensorflow::DEVICE_CPU), TVMDSOOp<CPUDevice>);
+REGISTER_KERNEL_BUILDER(Name("TvmDsoGraph").Device(tensorflow::DEVICE_CPU), TVMDSOGraph<CPUDevice>);
 #endif
